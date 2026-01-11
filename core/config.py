@@ -7,3 +7,9 @@ def get_oauth_config():
         "client_secret": os.environ["CLIENT_SECRET"],
         "redirect_uri": os.environ["REDIRECT_URL"],
     }
+
+
+def get_db_config():
+    return {
+        "db_url": os.environ["DB_URL"]
+    }
