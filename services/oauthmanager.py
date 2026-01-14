@@ -1,5 +1,10 @@
 import urllib.parse
 import requests
+from models.token_models import BearerToken, StravaAuthToken
+from sqlmodel import Session
+from fastapi import HTTPException
+
+
 class OauthManager:
     STRAVA_AUTH_URL = "https://www.strava.com/oauth/authorize"
     STRAVA_AUTH_V3_URL = "https://www.strava.com/api/v3/oauth/token"
@@ -22,7 +27,7 @@ class OauthManager:
             string: generate authorization url
         """
         params = {'client_id':self.client_id,
-                   "redirect_uri":"http://localhost/exchange_token",
+                   "redirect_uri":self.redirect_uri,
                    "response_type":"code",
                    "approval_prompt":"force",
                    "scope":"read"}
@@ -47,3 +52,15 @@ class OauthManager:
 
     def refresh_token(self):
         pass
+
+    def create_auth_token(self, db: Session, data: BearerToken):
+        token = StravaAuthToken(
+            strava_user_id=data.athlete.id,
+            token_type=data.token_type,
+            refresh_token=data.refresh_token,
+            expires_at=data.expires_at,
+        )
+        db.add(token)
+        db.commit()
+        db.refresh(token)
+        return token

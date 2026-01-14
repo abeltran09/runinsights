@@ -10,6 +10,4 @@ def get_oauth_config():
 
 
 def get_db_config():
-    return {
-        "db_url": os.environ["DB_URL"]
-    }
+    return os.getenv("DB_URL")
