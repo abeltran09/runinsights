@@ -53,6 +53,7 @@ class UserRead(BaseModel):
     firstname: str
     lastname: str
 
+
 class UserId(BaseModel):
     id: str
 

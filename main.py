@@ -58,6 +58,11 @@ def oauth_callback(request: Request,
     oauth.create_auth_token(db, data)
 
     return {
-        "message": "Authorization Successful",
-        "code":code
+        "message": "Authorization Successful"
     }
+
+# @app.get("/get-token")
+# def get_access_token(db: Annotated[Session, Depends(get_session)],
+#                      oauth: Annotated[OauthManager, Depends(get_oauth_manager)]
+#                      ):
+#     token = oauth.fetch_token(db, )
