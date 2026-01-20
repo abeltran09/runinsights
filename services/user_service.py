@@ -10,15 +10,12 @@ def create_user(db: Session, athlete: StravaAthlete):
         return existing_user
 
     user = User(
-            strava_user_id=athlete.id,
             firstname=athlete.firstname,
             lastname=athlete.lastname,
             city=athlete.city,
             state=athlete.state,
             country=athlete.country,
-            sex=athlete.sex,
-            strava_created_at=athlete.created_at,
-            strava_updated_at=athlete.updated_at
+            sex=athlete.sex
         )
 
     db.add(user)

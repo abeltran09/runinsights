@@ -1,5 +1,5 @@
 from sqlmodel import Field, SQLModel
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pydantic import BaseModel
 
@@ -11,7 +11,6 @@ class SexEnum(str, Enum):
 
 class User(SQLModel, table=True):
     user_skey: int | None = Field(default=None, primary_key=True)
-    strava_user_id: int = Field(nullable=False)
     firstname: str
     lastname: str
     city: str
@@ -20,8 +19,8 @@ class User(SQLModel, table=True):
     sex: SexEnum = Field(nullable=False)
     weight: float | None
     height: float | None
-    strava_created_at: datetime
-    strava_updated_at: datetime
+    created_via: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class StravaAthlete(BaseModel):
@@ -47,13 +46,6 @@ class StravaAthlete(BaseModel):
     follower: int | None
 
 
-
-class UserRead(BaseModel):
-    strava_user_id: str
-    firstname: str
-    lastname: str
-
-
 class UserId(BaseModel):
-    id: str
+    id: int
 

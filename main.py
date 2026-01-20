@@ -6,9 +6,10 @@ from services.oauthmanager import OauthManager
 from dependencies.strava_oauth import get_oauth_manager
 from dependencies.db import create_db_engine, create_all_tables, get_session
 from typing import Annotated
-from models.user_models import User, StravaAthlete
-from services.user_service import create_user
+from models.user_models import User, StravaAthlete, UserId
 from models.token_models import BearerToken
+from services.user_service import create_user
+from services.strava_connect import get_strava_connection
 
 
 load_dotenv()
@@ -54,8 +55,9 @@ def oauth_callback(request: Request,
     data = BearerToken(**token_data)
     athlete = StravaAthlete(**token_data['athlete'])
 
-    create_user(db, athlete)
-    oauth.create_auth_token(db, data)
+    user, connection = get_strava_connection(db, athlete)
+
+    oauth.create_auth_token(db, connection, data)
 
     return {
         "message": "Authorization Successful"
