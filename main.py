@@ -10,7 +10,8 @@ from models.user_models import User, StravaAthlete, UserId
 from models.token_models import BearerToken
 from services.user_service import create_user
 from services.strava_connect import get_strava_connection
-
+from dependencies.ingestors import get_strava_ingestor
+from pipelines.ingest.StravaIngestor import StravaIngestor
 
 load_dotenv()
 
@@ -61,6 +62,14 @@ def oauth_callback(request: Request,
 
     return {
         "message": "Authorization Successful"
+    }
+
+@app.get("/get-activities")
+def ingest_activities(ingestor: Annotated[StravaIngestor, Depends(get_strava_ingestor)]):
+    ingestor.run()
+
+    return {
+        'message': "Successful"
     }
 
 # @app.get("/get-token")

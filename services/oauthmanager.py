@@ -51,14 +51,14 @@ class OauthManager:
 
         return response.json()
 
-    def fetch_token(self, db: Session, strava_user_id: int):
-        query = select(StravaAuthToken).where(StravaAuthToken.strava_user_id == strava_user_id)
+    def fetch_token(self, db: Session, connection_id: int):
+        query = select(StravaAuthToken).where(StravaAuthToken.strava_connection_id == connection_id)
         token = db.exec(query).first()
 
         if not token:
             raise ValueError("This token does not exist")
 
-        now = datetime.now(timezone.utc)
+        now = datetime.utcnow()
 
         if token.expires_at <= now + self.REFRESH_BUFFER:
             refreshed = self.refresh_token(token)

@@ -6,7 +6,7 @@ from models.user_models import StravaAthlete
 
 class StravaAuthToken(SQLModel, table=True):
     id: int | None = Field(default_factory=None, primary_key=True)
-    strava_connection_id: int = Field(nullable=False)
+    strava_connection_id: int = Field(foreign_key='stravaconnection.id', nullable=False)
     token_type: str
     access_token: str
     refresh_token: str
