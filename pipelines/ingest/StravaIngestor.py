@@ -9,13 +9,16 @@ import requests
 import urllib.parse
 from datetime import datetime, timezone
 from pydantic import ValidationError
+from dependencies.strava_oauth import get_strava_rate_limiter
+import time
 
 
 class StravaIngestor(BaseIngestor):
 
-    def __init__(self, oauth_manager=None, max_retries: int = 3):
+    def __init__(self, oauth_manager=None, strava_rate_limiter=None, max_retries: int = 3):
         super().__init__(max_retries)
         self.oauth_manager = oauth_manager or get_oauth_manager()
+        self.strava_rate_limiter = strava_rate_limiter or get_strava_rate_limiter()
 
     def get_connections(self, db: Session) -> list[StravaConnection]:
         self.logger.info("Retrieving all Strava Connection...")
@@ -73,8 +76,6 @@ class StravaIngestor(BaseIngestor):
                          connection: StravaConnection,
                          mark_backfill_complete: bool = False):
 
-        print("storing")
-
         new_activities = []
 
         for activity in activities:
@@ -117,7 +118,6 @@ class StravaIngestor(BaseIngestor):
         return True
 
     def initial_backfill(self, db: Session, token: str, connection: StravaConnection):
-        print("HERE")
         URL = 'https://www.strava.com/api/v3/activities'
         params = {
             'page': 1,
@@ -136,6 +136,11 @@ class StravaIngestor(BaseIngestor):
 
             if not activities:
                 break
+
+            self.strava_rate_limiter.update_from_headers(activity_resp.headers)
+
+            if self.strava_rate_limiter.should_throttle():
+                time.sleep(15*60)
 
             all_activities.extend(activities)
             params['page'] += 1

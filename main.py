@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, Request, HTTPException
+from fastapi import FastAPI, Depends, Request, HTTPException, Query
 from sqlmodel import Session
 from services.oauthmanager import OauthManager
 from dependencies.strava_oauth import get_oauth_manager
@@ -72,8 +72,14 @@ def ingest_activities(ingestor: Annotated[StravaIngestor, Depends(get_strava_ing
         'message': "Successful"
     }
 
-# @app.get("/get-token")
-# def get_access_token(db: Annotated[Session, Depends(get_session)],
-#                      oauth: Annotated[OauthManager, Depends(get_oauth_manager)]
-#                      ):
-#     token = oauth.fetch_token(db, )
+
+@app.get("/get-token")
+def get_access_token(db: Annotated[Session, Depends(get_session)],
+                     oauth: Annotated[OauthManager, Depends(get_oauth_manager)],
+                     connection_id: Annotated[int, Query()]
+                     ):
+    token = oauth.fetch_token(db, connection_id)
+
+    return {
+        'access_token': token.access_token
+    }
