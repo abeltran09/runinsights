@@ -1,7 +1,7 @@
 from sqlmodel import Field, SQLModel
 from pydantic import BaseModel, ValidationError
 from datetime import datetime, timezone
-from sqlalchemy import BigInteger, Column
+from sqlalchemy import BigInteger, Column, ForeignKey
 
 
 class Activities(SQLModel, table=True):
@@ -21,6 +21,20 @@ class Activities(SQLModel, table=True):
     max_heart_rate: float = Field(nullable=True)
 
 
+class ActivityStreams(SQLModel, table=True):
+    id: int | None = Field(default=None, nullable=False, primary_key=True)
+    strava_activity_id: int = Field(sa_column=Column(BigInteger, ForeignKey('activities.strava_activity_id'), nullable=False))
+    time_sec: int = Field(nullable=False)
+    distance_m: float | None
+    heartrate_bpm: int | None
+
+
+class RawActivityStreamIn(BaseModel):
+    stream_type: str
+    data: list
+    stream_size: int
+
+
 class RawActivitiesIn(BaseModel):
     id: int
     distance: float
@@ -33,7 +47,7 @@ class RawActivitiesIn(BaseModel):
     max_speed: float
     has_heartrate: bool
     average_heartrate: float | None = None
-    max_heart_rate: float | None = None
+    max_heartrate: float | None = None
 
 
 def validate_raw_data(data: dict):

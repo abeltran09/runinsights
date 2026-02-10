@@ -27,6 +27,9 @@ class StravaRateLimiter:
             self.read_daily_usage >= self.read_daily_limit - buffer
         )
 
+    def is_daily_limit_hit(self, buffer: int = 10) -> bool:
+        return self.read_daily_usage >= self.read_daily_limit - buffer
+
 
 
 

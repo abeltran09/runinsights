@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, Request, HTTPException, Query
-from sqlmodel import Session
+from sqlmodel import Session, select
 from services.oauthmanager import OauthManager
 from dependencies.strava_oauth import get_oauth_manager
 from dependencies.db import create_db_engine, create_all_tables, get_session
@@ -12,6 +12,11 @@ from services.user_service import create_user
 from services.strava_connect import get_strava_connection
 from dependencies.ingestors import get_strava_ingestor
 from pipelines.ingest.StravaIngestor import StravaIngestor
+from models.activities import Activities, ActivityStreams
+from models.stravaconnection import StravaConnection
+import requests
+from sqlalchemy.exc import IntegrityError
+from psycopg2.errors import UniqueViolation
 
 load_dotenv()
 
@@ -83,3 +88,66 @@ def get_access_token(db: Annotated[Session, Depends(get_session)],
     return {
         'access_token': token.access_token
     }
+
+
+@app.get("/test-func")
+def get_access_token(db: Annotated[Session, Depends(get_session)]):
+
+    activity_list = list(db.exec(
+        select(Activities)
+        .where(Activities.strava_connection_id == StravaConnection.id).limit(1)
+    ).all())
+
+    token = '5993d259a74845518847462ca6d3dc82b1c7f7b7'
+
+    url = "https://www.strava.com/api/v3/activities/{activity_id}/streams"
+
+    params = {
+        'keys': 'time,distance,heartrate',
+        'key_by_type': 'true'
+    }
+
+    headers = {
+        'Authorization': f'Bearer {token}'
+    }
+
+    for activity in activity_list:
+        stream_activity_resp = requests.get(
+            url.format(activity_id=activity.strava_activity_id),
+            params=params,
+            headers=headers)
+
+        stream_activity_resp.raise_for_status()
+
+        streams = stream_activity_resp.json()
+
+        time_data = streams.get("time", {}).get("data", [])
+        distance_data = streams.get("distance", {}).get("data", [])
+        hr_data = streams.get("heartrate", {}).get("data", [])
+
+        processed_stream = []
+
+        for i, t in enumerate(time_data):
+            processed_stream.append(
+                ActivityStreams(
+                    strava_activity_id=activity.strava_activity_id,
+                    time_sec=t,
+                    distance_m=distance_data[i] if i < len(distance_data) else None,
+                    heartrate_bpm=hr_data[i] if i < len(hr_data) else None
+                )
+            )
+        try:
+            db.add_all(processed_stream)
+            db.commit()
+
+        except IntegrityError as e:
+            db.rollback()
+            if isinstance(e.orig, UniqueViolation):
+                continue
+            else:
+                raise
+
+
+        return {
+            'message':'successful'
+        }
