@@ -5,7 +5,7 @@ from fastapi import Request
 
 def create_db_engine():
     db_url = get_db_config()
-    engine = create_engine(db_url, echo=True)
+    engine = create_engine(db_url)
     return engine
 
 

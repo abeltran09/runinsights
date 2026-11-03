@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from enum import Enum
 
 
-class PipelineStatus(Enum):
+class PipelineStatus(str, Enum):
     STARTED = "started"
     RUNNING = "running"
     SKIPPED = "skipped"

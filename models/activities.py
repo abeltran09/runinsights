@@ -1,7 +1,7 @@
 from sqlmodel import Field, SQLModel
 from pydantic import BaseModel, ValidationError
 from datetime import datetime, timezone
-from sqlalchemy import BigInteger, Column, ForeignKey
+from sqlalchemy import BigInteger, Column, ForeignKey, UniqueConstraint
 
 
 class Activities(SQLModel, table=True):
@@ -25,6 +25,8 @@ class Activities(SQLModel, table=True):
 
 
 class ActivityStreams(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint('strava_activity_id', 'time_sec'),)
+
     id: int | None = Field(default=None, nullable=False, primary_key=True)
     strava_activity_id: int = Field(sa_column=Column(BigInteger, ForeignKey('activities.strava_activity_id'), nullable=False))
     time_sec: int = Field(nullable=False)

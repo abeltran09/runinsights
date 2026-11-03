@@ -8,6 +8,10 @@ class StravaRateLimiter:
         self.read_daily_usage = 0
 
     def update_from_headers(self, headers: dict) -> None:
+        # Some error responses (e.g. 5xx) don't carry rate limit headers; keep the last known values
+        if 'x-readratelimit-usage' not in headers or 'x-readratelimit-limit' not in headers:
+            return
+
         usage_15, usage_daily = map(
             int, headers['x-readratelimit-usage'].split(",")
         )
@@ -29,6 +33,10 @@ class StravaRateLimiter:
 
     def is_daily_limit_hit(self, buffer: int = 10) -> bool:
         return self.read_daily_usage >= self.read_daily_limit - buffer
+
+    def reset_15_min_window(self) -> None:
+        """Call after sleeping out a 15 min window; the next response's headers will correct it."""
+        self.read_rate_15_usage = 0
 
 
 

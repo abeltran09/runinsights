@@ -58,9 +58,13 @@ class OauthManager:
         if not token:
             raise ValueError("This token does not exist")
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
+        expires_at = token.expires_at
+        if expires_at.tzinfo is None:
+            # Stored as UTC in a timezone-naive column
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
 
-        if token.expires_at <= now + self.REFRESH_BUFFER:
+        if expires_at <= now + self.REFRESH_BUFFER:
             refreshed = self.refresh_token(token)
 
             token.access_token = refreshed.access_token
@@ -87,14 +91,18 @@ class OauthManager:
         return UserToken(**response.json())
 
     def create_auth_token(self, db: Session, strava_connection: StravaConnection, data: BearerToken):
-        token = StravaAuthToken(
-            strava_connection_id=strava_connection.id,
-            strava_user_id=data.athlete.id,
-            access_token=data.access_token,
-            token_type=data.token_type,
-            refresh_token=data.refresh_token,
-            expires_at=data.expires_at,
-        )
+        """Saves the connection's token, replacing the existing one if the athlete re-authorizes."""
+        query = select(StravaAuthToken).where(StravaAuthToken.strava_connection_id == strava_connection.id)
+        token = db.exec(query).first()
+
+        if token is None:
+            token = StravaAuthToken(strava_connection_id=strava_connection.id)
+
+        token.access_token = data.access_token
+        token.token_type = data.token_type
+        token.refresh_token = data.refresh_token
+        token.expires_at = data.expires_at
+
         db.add(token)
         db.commit()
         db.refresh(token)

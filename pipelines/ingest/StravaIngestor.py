@@ -1,21 +1,31 @@
 from pipelines.ingest.base import BaseIngestor
-from models.user_models import User
-from models.activities import Activities, validate_raw_data, ActivityStreams, RawActivityStreamIn
+from models.activities import Activities, validate_raw_data, ActivityStreams
 from models.stravaconnection import StravaConnection, PipelineStatus
 from sqlmodel import select, Session
-from sqlalchemy import desc
+from sqlalchemy import func
 from dependencies.strava_oauth import get_oauth_manager
 import requests
-import urllib.parse
-from datetime import datetime, timezone
-from pydantic import ValidationError
+from datetime import datetime, timezone, timedelta
 from dependencies.strava_oauth import get_strava_rate_limiter
 import time
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy import update
+
+
+def to_epoch(dt: datetime) -> int:
+    """Postgres hands back naive datetimes that are really UTC; treat them that way."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
 
 
 class StravaIngestor(BaseIngestor):
+    ACTIVITIES_URL = 'https://www.strava.com/api/v3/athlete/activities'
+    STREAMS_URL = 'https://www.strava.com/api/v3/activities/{activity_id}/streams'
+    PER_PAGE = 200  # Strava's max
+    REQUEST_TIMEOUT = 30
+    RATE_LIMIT_SLEEP = 15 * 60
+    # Re-check a few days back so activities synced late (older start_date) are not missed
+    INCREMENTAL_LOOKBACK = timedelta(days=3)
 
     def __init__(self, oauth_manager=None, strava_rate_limiter=None, max_retries: int = 3):
         super().__init__(max_retries)
@@ -24,9 +34,8 @@ class StravaIngestor(BaseIngestor):
 
     def get_connections(self, db: Session) -> list[StravaConnection]:
         self.logger.info("Retrieving all Strava Connection...")
-        query = select(StravaConnection)
-        users = db.exec(query).all()
-        return list(users)
+        query = select(StravaConnection).where(StravaConnection.is_active)
+        return list(db.exec(query).all())
 
     def ingest(self, db: Session):
         strava_connections = self.get_connections(db)
@@ -35,73 +44,96 @@ class StravaIngestor(BaseIngestor):
             try:
                 self._ingest_connection(db, connection)
             except Exception as e:
+                db.rollback()
                 self.logger.error(f"Failed to ingest data from user {connection.id}: {e}", exc_info=True)
 
     def _ingest_connection(self, db: Session, connection: StravaConnection):
         self.logger.info(f"Starting ingestion for connection {connection.id}")
 
         token = self.oauth_manager.fetch_token(db, connection.id)
-        fetch_status = self._fetch_activities(db, token.access_token, connection)
+        result = self._fetch_activities(db, token.access_token, connection)
 
-        if fetch_status["completed"]:
-            self.logger.info("Successful ingest")
-        elif not fetch_status["completed"]:
-            if fetch_status['status'] == 'failed':
-                self.logger.info("Ingestion has failed")
-            elif fetch_status['status'] == 'skipped':
-                self.logger.info("No new records to ingest")
+        if result['status'] == PipelineStatus.COMPLETE:
+            self.logger.info(f"Connection {connection.id}: ingested {result['ingested']} activities")
+        elif result['status'] == PipelineStatus.PAUSED:
+            self.logger.warning(
+                f"Connection {connection.id}: paused on Strava daily limit after {result['ingested']} activities"
+            )
         else:
-            self.logger.info(f"No new activities for connection: {connection.id}")
+            self.logger.error(f"Connection {connection.id}: ingestion failed - {result.get('error')}")
 
-
-    def _fetch_activities(self, db: Session, token: str, connection: StravaConnection):
-        """
-        200 Successful request
-        201 Your activity/etc. was successfully created
-        401 Unauthorized
-        403 Forbidden; you cannot access
-        404 Not found; the requested asset does not exist, or you are not authorized to see it
-        429 Too Many Requests; you have exceeded rate limits
-        500 Strava is having issues, please check https://status.strava.com
-        :param db:
-        :param connection:
-        :param token:
-        :return:
-        """
+    def _fetch_activities(self, db: Session, token: str, connection: StravaConnection) -> dict:
         if not connection.initial_backfill_completed:
             self.logger.info(f"Performing initial backfill for connection: {connection.id}")
             return self.initial_backfill(db, token, connection)
 
-        else:
-            self.logger.info(f"Performing incremental sync for connection: {connection.id}")
-            return self.incremental_ingest(db, token, connection)
+        self.logger.info(f"Performing incremental sync for connection: {connection.id}")
+        return self.incremental_ingest(db, token, connection)
 
-    def _store_activities(self, db: Session, activities: list[dict], connection: StravaConnection):
+    def _strava_get(self, url: str, token: str, params: dict) -> requests.Response | None:
+        """
+        GET a Strava endpoint while respecting rate limits.
+        Sleeps through the 15 min limit; returns None once the daily limit is reached.
+        Raises for any non-429 error status (401, 403, 404, 5xx).
+        """
+        headers = {'Authorization': f'Bearer {token}'}
+
+        while True:
+            if self.strava_rate_limiter.is_daily_limit_hit():
+                return None
+            if self.strava_rate_limiter.should_throttle():
+                self.logger.info("15 min rate limit approaching, sleeping for 15 minutes")
+                self._sleep_out_rate_limit()
+
+            resp = requests.get(url, params=params, headers=headers, timeout=self.REQUEST_TIMEOUT)
+            self.strava_rate_limiter.update_from_headers(resp.headers)
+
+            if resp.status_code == 429:
+                self.logger.warning(f"Got 429 response. Daily usage: {self.strava_rate_limiter.read_daily_usage}")
+                if self.strava_rate_limiter.is_daily_limit_hit():
+                    return None
+                self.logger.info("15 min rate limit hit, sleeping for 15 minutes")
+                self._sleep_out_rate_limit()
+                continue
+
+            if not resp.ok:
+                # Strava explains 401/403s in the body (e.g. missing scope), which raise_for_status drops
+                self.logger.error(f"Strava returned {resp.status_code} for {url}: {resp.text}")
+            resp.raise_for_status()
+            return resp
+
+    def _sleep_out_rate_limit(self):
+        time.sleep(self.RATE_LIMIT_SLEEP)
+        self.strava_rate_limiter.reset_15_min_window()
+
+    def _store_activities(self, db: Session, activities: list[dict], connection: StravaConnection) -> int:
         activities_to_insert = []
         for activity in activities:
-            try:
-                raw_activity = validate_raw_data(activity)
+            raw_activity = validate_raw_data(activity)
+            if raw_activity is None:
+                self.logger.error(
+                    f"Skipping activity {activity.get('id')} for connection {connection.id}: failed validation"
+                )
+                continue
 
-                activities_to_insert.append({
-                    'strava_connection_id': connection.id,
-                    'strava_activity_id': raw_activity.id,
-                    'name': raw_activity.name,
-                    'distance': raw_activity.distance,
-                    'moving_time': raw_activity.moving_time,
-                    'sport_type': raw_activity.sport_type,
-                    'device_name': raw_activity.device_name,
-                    'start_date': raw_activity.start_date,
-                    'timezone': raw_activity.timezone,
-                    'average_speed': raw_activity.average_speed,
-                    'max_speed': raw_activity.max_speed,
-                    'has_heartrate': raw_activity.has_heartrate,
-                    'average_heartrate': raw_activity.average_heartrate,
-                    'max_heart_rate': raw_activity.max_heartrate,
-                    'has_kudos': raw_activity.has_kudos,
-                    'kudos_count': raw_activity.kudos_count
-                })
-            except ValidationError as e:
-                self.logger.error(f"Failed to validate activity for connection: {connection.id} - {e}")
+            activities_to_insert.append({
+                'strava_connection_id': connection.id,
+                'strava_activity_id': raw_activity.id,
+                'name': raw_activity.name,
+                'distance': raw_activity.distance,
+                'moving_time': raw_activity.moving_time,
+                'sport_type': raw_activity.sport_type,
+                'device_name': raw_activity.device_name,
+                'start_date': raw_activity.start_date,
+                'timezone': raw_activity.timezone,
+                'average_speed': raw_activity.average_speed,
+                'max_speed': raw_activity.max_speed,
+                'has_heartrate': raw_activity.has_heartrate,
+                'average_heartrate': raw_activity.average_heartrate,
+                'max_heart_rate': raw_activity.max_heartrate,
+                'has_kudos': raw_activity.has_kudos,
+                'kudos_count': raw_activity.kudos_count
+            })
 
         if activities_to_insert:
             insert_stmt = insert(Activities).values(activities_to_insert)
@@ -115,238 +147,156 @@ class StravaIngestor(BaseIngestor):
                 }
             )
             db.execute(update_insert_stmt)
-            db.commit()
 
-        connection.total_activities_ingested += len(activities_to_insert)
-        connection.last_activity_ingested_at = datetime.utcnow()
-        connection.last_synced_at = datetime.utcnow()
+        self._update_connection(db, connection)
+        return len(activities_to_insert)
 
+    def _update_connection(self, db: Session, connection: StravaConnection):
+        # Count from the table so re-fetched (upserted) activities are never double counted
+        connection.total_activities_ingested = db.exec(
+            select(func.count()).select_from(Activities).where(Activities.strava_connection_id == connection.id)
+        ).one()
+        now = datetime.now(timezone.utc)
+        connection.last_activity_ingested_at = now
+        connection.last_synced_at = now
         db.add(connection)
         db.commit()
-        return True
 
     def _ingest_activity_streams(self, db: Session, token: str, connection: StravaConnection):
+        """Fetch per-second streams for activities that do not have any stored yet. Not wired into ingest() yet."""
+        has_streams = select(ActivityStreams.strava_activity_id).where(
+            ActivityStreams.strava_activity_id == Activities.strava_activity_id
+        ).exists()
+
         activity_list = list(db.exec(
             select(Activities)
-            .where(Activities.strava_connection_id == connection.id).limit(1)
+            .where(Activities.strava_connection_id == connection.id)
+            .where(~has_streams)
         ).all())
-
-        url = "https://www.strava.com/api/v3/activities/{activity_id}/streams"
 
         params = {
             'keys': 'time,distance,heartrate',
             'key_by_type': 'true'
         }
 
-        headers = {
-            'Authorization': f'Bearer {token}'
-        }
-
         for activity in activity_list:
-            stream_activity_resp = requests.get(
-                url.format(activity_id=activity.strava_activity_id),
-                params=params,
-                headers=headers)
+            resp = self._strava_get(
+                self.STREAMS_URL.format(activity_id=activity.strava_activity_id), token, params
+            )
+            if resp is None:
+                self.logger.warning(f"Daily limit reached while fetching streams for connection {connection.id}")
+                return
 
-            stream_activity_resp.raise_for_status()
-
-            streams = stream_activity_resp.json()
-
+            streams = resp.json()
             time_data = streams.get("time", {}).get("data", [])
             distance_data = streams.get("distance", {}).get("data", [])
             hr_data = streams.get("heartrate", {}).get("data", [])
 
-            processed_stream = []
+            processed_stream = [
+                {
+                    'strava_activity_id': activity.strava_activity_id,
+                    'time_sec': t,
+                    'distance_m': distance_data[i] if i < len(distance_data) else None,
+                    'heartrate_bpm': hr_data[i] if i < len(hr_data) else None
+                }
+                for i, t in enumerate(time_data)
+            ]
 
-            for i, t in enumerate(time_data):
-                processed_stream.append(
-                    ActivityStreams(
-                        strava_activity_id=activity.strava_activity_id,
-                        time_sec=t,
-                        distance_m=distance_data[i] if i < len(distance_data) else None,
-                        heartrate_bpm=hr_data[i] if i < len(distance_data) else None
-                    )
-                )
+            if processed_stream:
+                db.execute(insert(ActivityStreams).values(processed_stream).on_conflict_do_nothing(
+                    index_elements=["strava_activity_id", "time_sec"]
+                ))
+                db.commit()
 
-            db.add(processed_stream)
-            db.commit()
+    def initial_backfill(self, db: Session, token: str, connection: StravaConnection) -> dict:
+        """
+        Walks backwards through history using `before` as a cursor (Strava returns newest first).
+        If a previous run paused or failed, resumes from the oldest activity already stored.
+        """
+        oldest = db.exec(
+            select(func.min(Activities.start_date)).where(Activities.strava_connection_id == connection.id)
+        ).one()
+        before_ts = to_epoch(oldest) if oldest else None
+        if before_ts:
+            self.logger.info(f"Resuming backfill for connection {connection.id} before {oldest}")
 
-    def initial_backfill(self, db: Session, token: str, connection: StravaConnection):
-        URL = 'https://www.strava.com/api/v3/activities'
-        headers = {
-            'Authorization': f'Bearer {token}'
-        }
-
-        current_page = 1
+        self._checkpoint_backfill(db, connection, PipelineStatus.RUNNING)
         total_ingested = 0
 
         try:
             while True:
-                if self.strava_rate_limiter.should_throttle():
-                    if self.strava_rate_limiter.is_daily_limit_hit():
-                        self._checkpoint_backfill(db, connection, current_page, PipelineStatus.PAUSED)
-                        raise Exception(
-                            f"Daily limit reached at page {current_page}"
-                            f"Usage: {self.strava_rate_limiter.read_daily_usage/self.strava_rate_limiter.read_daily_limit}"
-                        )
-                    else:
-                        self.logger.info("15 min rate limit approaching sleep for 15 minutes")
-                        time.sleep(15*60)
+                params = {'per_page': self.PER_PAGE}
+                if before_ts:
+                    params['before'] = before_ts
 
-                params = {
-                    'page': current_page,
-                    'per_page': 50
-                }
+                resp = self._strava_get(self.ACTIVITIES_URL, token, params)
+                if resp is None:
+                    self._checkpoint_backfill(db, connection, PipelineStatus.PAUSED)
+                    return {'status': PipelineStatus.PAUSED, 'completed': False, 'ingested': total_ingested}
 
-                activity_resp = requests.get(URL, params=params, headers=headers)
-
-                self.strava_rate_limiter.update_from_headers(activity_resp.headers)
-
-                if activity_resp.status_code == 429:
-                    self.logger.warning(f"Got 429 response. Usage: {self.strava_rate_limiter.read_daily_usage}")
-
-                    if self.strava_rate_limiter.is_daily_limit_hit():
-                        self._checkpoint_backfill(db, connection, current_page, PipelineStatus.PAUSED)
-                        raise Exception(f"Daily limit exceeded at page {current_page}")
-                    else:
-                        self.logger.info("15 min rate limit approaching sleep for 15 minutes")
-                        time.sleep(15 * 60)
-                        continue
-
-                activity_resp.raise_for_status()
-                activities = activity_resp.json()
+                activities = resp.json()
 
                 if not activities:
-                    self.logger.info(
-                        f"Backfill ingest complete for connection {connection.id}. "
-                        f"Activities ingested: {total_ingested}"
-                    )
                     connection.backfill_status = PipelineStatus.COMPLETE
                     connection.initial_backfill_completed = True
+                    db.add(connection)
                     db.commit()
-                    self.logger.info("Backfill is complete")
-                    return {
-                        'status': 'complete',
-                        'completed': True,
-                        'last_page': current_page
-                    }
+                    self.logger.info(
+                        f"Backfill complete for connection {connection.id}. Activities ingested: {total_ingested}"
+                    )
+                    return {'status': PipelineStatus.COMPLETE, 'completed': True, 'ingested': total_ingested}
 
-
-                self.logger.info(f"Backfilling connection: {connection.id}, on page: {params['page']} backfill is in progress")
-                self._store_activities(db, activities, connection)
-                current_page += 1
-                total_ingested += len(activities)
+                self.logger.info(f"Backfilling connection {connection.id}: fetched {len(activities)} activities")
+                total_ingested += self._store_activities(db, activities, connection)
+                before_ts = min(to_epoch(datetime.fromisoformat(a['start_date'])) for a in activities)
 
         except Exception as e:
-            self.logger.error(f"Backfill failed: {e}")
-            return {
-                'status': PipelineStatus.FAILED,
-                'completed': False,
-                'last_page': current_page,
-                'error': str(e)
-            }
+            db.rollback()
+            self.logger.error(f"Backfill failed for connection {connection.id}: {e}", exc_info=True)
+            self._checkpoint_backfill(db, connection, PipelineStatus.FAILED)
+            return {'status': PipelineStatus.FAILED, 'completed': False, 'ingested': total_ingested, 'error': str(e)}
 
-    def _checkpoint_backfill(self, db:Session, connection: StravaConnection, page: int, status: PipelineStatus):
+    def _checkpoint_backfill(self, db: Session, connection: StravaConnection, status: PipelineStatus):
         connection.backfill_status = status
+        db.add(connection)
         db.commit()
-        self.logger.info(f"Checkpointed connection {connection.id} at page {page}, status: {status}")
+        self.logger.info(f"Connection {connection.id} backfill status: {status.value}")
 
     def incremental_ingest(self, db: Session, token: str, connection: StravaConnection) -> dict:
-        latest_activity = db.exec(
-            select(Activities.start_date)
-            .where(Activities.strava_connection_id == connection.id)
-            .order_by(desc(Activities.start_date))
-        ).first()
+        latest = db.exec(
+            select(func.max(Activities.start_date)).where(Activities.strava_connection_id == connection.id)
+        ).one()
 
-        if not latest_activity:
-            self.logger.info(f"No existing activities for connection: {connection.id}")
-            return {
-                'status': 'skipped',
-                'complete': False,
-                'reason': 'no_baseline'
-            }
-
-        URL = 'https://www.strava.com/api/v3/activities'
-        headers = {
-            'Authorization': f'Bearer {token}'
-        }
-
-        after_ts = int(latest_activity.timestamp()) - 1
+        # No activities yet (athlete had none at backfill time): fetch everything
+        after_ts = to_epoch(latest - self.INCREMENTAL_LOOKBACK) if latest else 0
         current_page = 1
         total_ingested = 0
 
         try:
             while True:
-                if self.strava_rate_limiter.should_throttle():
-                    if self.strava_rate_limiter.is_daily_limit_hit():
-                        self.logger.warning(f"Daily limit hit before page {current_page}")
-                        return {
-                            'status': PipelineStatus.PAUSED,
-                            'completed': False,
-                        }
-                    else:
-                        self.logger.info("15 min rate limit approaching sleep for 15 minutes")
-                        time.sleep(15 * 60)
-
                 params = {
                     'after': after_ts,
-                    'per_page': 50,
+                    'per_page': self.PER_PAGE,
                     'page': current_page
                 }
 
-                activity_resp = requests.get(URL, params=params, headers=headers)
+                resp = self._strava_get(self.ACTIVITIES_URL, token, params)
+                if resp is None:
+                    self.logger.warning(f"Daily limit hit before page {current_page}")
+                    return {'status': PipelineStatus.PAUSED, 'completed': False, 'ingested': total_ingested}
 
-                self.strava_rate_limiter.update_from_headers(activity_resp.headers)
-
-                if activity_resp.status_code == 429:
-                    self.logger.warning(f"Got 429 response. Usage: {self.strava_rate_limiter.read_daily_usage}")
-
-                    if self.strava_rate_limiter.is_daily_limit_hit():
-                        self._checkpoint_backfill(db, connection, current_page, "paused_daily_limit")
-                        raise Exception(f"Daily limit exceeded at page {current_page}")
-                    else:
-                        self.logger.info("15 min rate limit approaching sleep for 15 minutes")
-                        time.sleep(15 * 60)
-                        continue
-
-                activity_resp.raise_for_status()
-                activities = activity_resp.json()
+                activities = resp.json()
 
                 if not activities:
-                    if total_ingested > 0:
-                        self._update_connection(db, connection, total_ingested)
-                        self.logger.info(f"Incremental updates for connection: {connection.id} is complete")
-                        return {
-                            'status': PipelineStatus.COMPLETE,
-                            'completed': True,
-                            'ingested': total_ingested
-                        }
-                    else:
-                        self.logger.info(f"No updates for connection: {connection.id} is complete")
-                        return {
-                            'status': PipelineStatus.COMPLETE,
-                            'completed': True,
-                            'ingested': total_ingested
-                        }
+                    self._update_connection(db, connection)
+                    self.logger.info(f"Incremental sync for connection {connection.id} complete")
+                    return {'status': PipelineStatus.COMPLETE, 'completed': True, 'ingested': total_ingested}
 
-
-                self.logger.info(
-                    f"Updating connection: {connection.id}, on page: {params['page']} backfill is in progress")
-
-                self._store_activities(db, activities, connection)
-
+                self.logger.info(f"Syncing connection {connection.id}, page {current_page}")
+                total_ingested += self._store_activities(db, activities, connection)
                 current_page += 1
-                total_ingested += len(activities)
 
         except Exception as e:
-            self.logger.error(f"Incremental update failed: {e}")
-            return {
-                'status': PipelineStatus.FAILED,
-                'completed': False,
-                'error': str(e)
-            }
-
-    def _update_connection(self, db: Session, connection: StravaConnection, total_ingested: int):
-        connection.total_activities_ingested += total_ingested
-        db.commit()
-
+            db.rollback()
+            self.logger.error(f"Incremental sync failed for connection {connection.id}: {e}", exc_info=True)
+            return {'status': PipelineStatus.FAILED, 'completed': False, 'ingested': total_ingested, 'error': str(e)}

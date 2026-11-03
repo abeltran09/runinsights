@@ -11,9 +11,9 @@ runinsights connects to your Strava account, pulls your activity history into a 
 
 - **Strava sign-in (OAuth 2.0):** generates a Strava authorization link, handles the callback, and stores the athlete's access and refresh tokens. Tokens are refreshed automatically when they are within an hour of expiring.
 - **User and connection setup:** the first time an athlete authorizes, runinsights creates a `User` from their Strava profile and a `StravaConnection` that links them to their Strava account. If they authorize again, the existing connection is reused.
-- **First-time backfill:** for a new connection, runinsights pages through the athlete's whole Strava activity history and saves every activity.
-- **Incremental sync:** after the backfill finishes, later runs only fetch activities newer than the most recent one already stored.
-- **Strava rate-limit handling:** the ingestor reads Strava's rate-limit headers after each request. When the 15-minute limit gets close, it pauses. When the daily limit is reached, it records the paused state and stops.
+- **First-time backfill:** for a new connection, runinsights walks backwards through the athlete's whole Strava activity history, 200 activities per request, and saves every activity. If a backfill is paused or fails, the next run resumes from the oldest activity already saved instead of starting over.
+- **Incremental sync:** after the backfill finishes, later runs fetch activities from the last 3 days before the most recent one stored onward. The overlap catches runs that a watch synced late.
+- **Strava rate-limit handling:** the ingestor reads Strava's rate-limit headers after each request. When the 15-minute limit gets close, it waits out the window. When the daily limit is reached, it records the paused state and stops until the next run.
 - **Validation and safe upserts:** each activity is validated with Pydantic before it is written. Activities are upserted on their Strava ID, so re-running ingestion doesn't create duplicates, and edited names, distances and kudos counts get updated.
 
 ## How it works
@@ -22,7 +22,8 @@ runinsights connects to your Strava account, pulls your activity history into a 
  Strava OAuth ──► /oauth/callback ──► User + StravaConnection + StravaAuthToken
                                                 │
                                                 ▼
-              /get-activities ──► StravaIngestor.run()
+  python -m pipelines.run_ingest ──► StravaIngestor.run()
+              (or POST /ingest)
                                      │  for each StravaConnection:
                                      │    fetch / refresh token
                                      │    ├─ no backfill yet → initial_backfill()
@@ -50,6 +51,7 @@ runinsights/
 │   ├── token_models.py        # StravaAuthToken table, token schemas
 │   └── activities.py          # Activities and ActivityStreams tables, raw input schemas
 ├── pipelines/
+│   ├── run_ingest.py          # Command-line entry point for ingestion
 │   └── ingest/
 │       ├── base.py            # BaseIngestor: shared run loop and logging
 │       └── StravaIngestor.py  # Strava backfill and incremental sync
@@ -85,7 +87,7 @@ git clone https://github.com/abeltran09/runinsights.git
 cd runinsights
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install fastapi uvicorn sqlmodel psycopg2-binary requests python-dotenv
+pip install -r requirements.txt
 ```
 
 ### Configure
@@ -106,7 +108,13 @@ uvicorn main:app --reload
 
 1. Open `http://localhost:8000/request-access`. It returns a Strava authorization link.
 2. Open that link in your browser and approve access. Strava redirects you to `/oauth/callback`, which saves your account and tokens.
-3. Open `http://localhost:8000/get-activities` to run ingestion. The first run downloads your full history. Later runs only pull new activities.
+3. Run ingestion:
+
+   ```bash
+   python -m pipelines.run_ingest
+   ```
+
+   The first run downloads your full history. Later runs only pull new activities. This command is also what you'd point a scheduler (cron, Windows Task Scheduler) at. You can also trigger ingestion with `POST /ingest` while the API is running.
 
 ## API endpoints
 
@@ -114,17 +122,16 @@ uvicorn main:app --reload
 | --- | --- | --- |
 | GET | `/request-access` | Returns the Strava authorization URL. |
 | GET | `/oauth/callback` | Strava redirects here after you authorize. Exchanges the code for tokens and creates the user and connection. |
-| GET | `/get-activities` | Runs ingestion for every connected account. |
-| GET | `/get-token?connection_id=<id>` | Development only: returns a valid access token for a connection, refreshing it if needed. |
+| POST | `/ingest` | Starts ingestion for every connected account in the background and returns immediately. |
 
 ## Roadmap
 - [x] Strava OAuth and token refresh
 - [x] Full-history backfill
 - [x] Incremental sync
 - [x] Rate-limit handling
-- [ ] Resume a paused backfill from where it stopped
+- [x] Resume a paused backfill from where it stopped
 - [ ] Activity streams (per-second pace, heart rate, cadence, elevation)
-- [ ] Run ingestion on a schedule instead of through an endpoint
+- [ ] Run ingestion on a schedule
 - [ ] Database migrations
 - [ ] Insights: pace and heart-rate zones, heart-rate drift, grade-adjusted pace, weekly mileage and training load
 - [ ] A dashboard to explore it all

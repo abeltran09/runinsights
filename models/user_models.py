@@ -13,10 +13,10 @@ class User(SQLModel, table=True):
     user_skey: int | None = Field(default=None, primary_key=True)
     firstname: str
     lastname: str
-    city: str
-    state: str
-    country: str
-    sex: SexEnum = Field(nullable=False)
+    city: str | None
+    state: str | None
+    country: str | None
+    sex: SexEnum | None
     weight: float | None
     height: float | None
     created_via: str
@@ -24,26 +24,28 @@ class User(SQLModel, table=True):
 
 
 class StravaAthlete(BaseModel):
+    # Strava returns null for, or leaves out, these when the athlete hasn't filled out their profile,
+    # so every optional field needs a default (in Pydantic v2 `X | None` alone is still required)
     id: int
-    username: str | None
-    resource_state: int | None
+    username: str | None = None
+    resource_state: int | None = None
     firstname: str
     lastname: str
-    bio: str | None
-    city: str
-    state: str
-    country: str
-    sex: SexEnum
-    premium: bool
-    summit: bool
+    bio: str | None = None
+    city: str | None = None
+    state: str | None = None
+    country: str | None = None
+    sex: SexEnum | None = None
+    premium: bool = False
+    summit: bool = False
     created_at: datetime
     updated_at: datetime
-    badge_type_id: int | None
-    weight: float | None
-    profile_medium: str | None
-    profile: str | None
-    friend: int | None
-    follower: int | None
+    badge_type_id: int | None = None
+    weight: float | None = None
+    profile_medium: str | None = None
+    profile: str | None = None
+    friend: int | None = None
+    follower: int | None = None
 
 
 class UserId(BaseModel):
