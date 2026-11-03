@@ -1,6 +1,7 @@
 import urllib.parse
 import requests
 from models.token_models import BearerToken, StravaAuthToken, UserToken
+from models.stravaconnection import StravaConnection
 from sqlmodel import Session, select
 from models.user_models import StravaAthlete
 from fastapi import HTTPException
@@ -33,7 +34,7 @@ class OauthManager:
                    "redirect_uri":self.redirect_uri,
                    "response_type":"code",
                    "approval_prompt":"force",
-                   "scope":"read"}
+                   "scope":"read,activity:read_all"}
 
         return f"{self.STRAVA_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
@@ -50,26 +51,25 @@ class OauthManager:
 
         return response.json()
 
-    def fetch_token(self, db: Session, user: StravaAthlete):
-        query = select(StravaAuthToken).where(StravaAuthToken.strava_user_id == user.id)
+    def fetch_token(self, db: Session, connection_id: int):
+        query = select(StravaAuthToken).where(StravaAuthToken.strava_connection_id == connection_id)
         token = db.exec(query).first()
 
         if not token:
             raise ValueError("This token does not exist")
 
-        now = datetime.now(timezone.utc)
+        now = datetime.utcnow()
 
-        if token.expires_at > now or token.expires_at - self.REFRESH_BUFFER > now:
-            return token
+        if token.expires_at <= now + self.REFRESH_BUFFER:
+            refreshed = self.refresh_token(token)
 
-        refreshed_token = self.refresh_token(token)
+            token.access_token = refreshed.access_token
+            token.refresh_token = refreshed.refresh_token
+            token.expires_at = refreshed.expires_at
 
-        token.refresh_token = refreshed_token.refresh_token
-        token.expires_at = refreshed_token.expires_at
-
-        db.add(token)
-        db.commit()
-        db.refresh(token)
+            db.add(token)
+            db.commit()
+            db.refresh(token)
 
         return token
 
@@ -86,8 +86,9 @@ class OauthManager:
 
         return UserToken(**response.json())
 
-    def create_auth_token(self, db: Session, data: BearerToken):
+    def create_auth_token(self, db: Session, strava_connection: StravaConnection, data: BearerToken):
         token = StravaAuthToken(
+            strava_connection_id=strava_connection.id,
             strava_user_id=data.athlete.id,
             access_token=data.access_token,
             token_type=data.token_type,
