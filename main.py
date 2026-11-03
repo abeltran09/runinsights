@@ -17,6 +17,8 @@ from models.stravaconnection import StravaConnection
 import requests
 from sqlalchemy.exc import IntegrityError
 from psycopg2.errors import UniqueViolation
+from sqlalchemy import desc
+from sqlalchemy.dialects.postgresql import insert
 
 load_dotenv()
 
@@ -150,4 +152,82 @@ def get_access_token(db: Annotated[Session, Depends(get_session)]):
 
         return {
             'message':'successful'
+        }
+
+@app.get("/test-increment")
+def get_access_token(db: Annotated[Session, Depends(get_session)]):
+    latest_activity = db.exec(
+        select(Activities.start_date)
+        .where(Activities.strava_connection_id == StravaConnection.id)
+        .order_by(desc(Activities.start_date))
+    ).first()
+
+    if not latest_activity:
+        print(f"No existing activities for connection: {StravaConnection.id}")
+        return {
+            'status': 'skipped',
+            'complete': False,
+            'reason': 'no_baseline'
+        }
+
+    URL = 'https://www.strava.com/api/v3/activities'
+    headers = {
+        'Authorization': f'Bearer a8a640e2d8b3c07939684e91b339e4160de8ba84'
+    }
+
+    current_page = 1
+    total_ingested = 0
+    after_ts = int(latest_activity.timestamp()) - 1
+
+    try:
+        while True:
+
+            params = {
+                'after': after_ts,
+                'per_page': 50,
+                'page': current_page
+            }
+
+            activity_resp = requests.get(URL, params=params, headers=headers)
+
+            activity_resp.raise_for_status()
+            activities = activity_resp.json()
+
+            if not activities:
+                return {
+                    'status': 'complete',
+                    'completed': True,
+                    'last_page': current_page - 1,
+                    'ingested': total_ingested
+                }
+
+            print(f"Page {current_page}: fetched {len(activities)} activities")
+
+            for activity in activities:
+                print(
+                    f"id={activity['id']} "
+                    f"start_date={activity['start_date']} "
+                    f"name={activity.get('name')}"
+                )
+
+            insert_stmt = insert(Activities).values(activities)
+            update_insert_stmt = insert_stmt.on_conflict_do_update(
+                index_elements=["strava_activity_id"],
+                set_={
+                    "name": insert_stmt.excluded.name,
+                    "distance": insert_stmt.excluded.distance,
+                    "has_kudos": insert_stmt.excluded.has_kudos,
+                    "kudos_count": insert_stmt.excluded.kudos_count
+                }
+            )
+
+            total_ingested += len(activities)
+            current_page += 1
+
+    except Exception as e:
+        return {
+            'status': 'failed',
+            'completed': False,
+            'last_page': current_page,
+            'error': str(e)
         }

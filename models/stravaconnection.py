@@ -1,15 +1,16 @@
 from sqlmodel import Field, SQLModel
 from datetime import datetime, timezone
 from enum import Enum
-from pydantic import BaseModel
-
-class Progress(str, Enum):
-    not_started: str = "not_started",
-    in_progress: str = "in_progress",
-    complete: str = "complete"
-    paused: str = "paused_daily_limit"
 
 
+class PipelineStatus(Enum):
+    STARTED = "started"
+    RUNNING = "running"
+    SKIPPED = "skipped"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    PAUSED = "paused_daily_limit"
+    NOT_STARTED = "not_started"
 
 
 class StravaConnection(SQLModel, table=True):
@@ -19,9 +20,8 @@ class StravaConnection(SQLModel, table=True):
 
     # ingestion tracking
     last_activity_ingested_at: datetime = Field(nullable=True)
-    backfill_status: Progress = Field(default='not_started')
+    backfill_status: PipelineStatus = Field(default=PipelineStatus.NOT_STARTED)
     initial_backfill_completed: bool = Field(default=False)
-    last_page: int = Field(default=1)
 
     # metadata
     connected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
